@@ -1,0 +1,51 @@
+
+# Change pip's cache directory to be inside the project directory since we can
+# only cache local items.
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+# Pip's cache doesn't store the python packages
+# https://pip.pypa.io/en/stable/topics/caching/
+#
+# If you want to also cache the installed packages, you have to install
+# them in a virtualenv and cache it as well.
+cache:
+  paths:
+    - .cache/pip
+    - venv/
+
+before_script:
+    - "wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+    - "ls"
+    - "apt-get update"
+    - "apt-get install -y --no-install-recommends ./google-chrome-stable_current_amd64.deb"
+    - "pip3 install nose"
+    - "pip3 install coverage"
+    - "pip3 install coveralls"
+    - "pip3 install ."
+    - "useradd testuser"
+    - "pwd "
+    - "mkdir -p /home/testuser"
+    - "ls /"
+    - "ls /home/"
+    - "chown -R testuser:testuser /home/testuser"
+    - "chown -R testuser:testuser ."
+
+.test:
+  script:
+    - exec su testuser -c 'python $(which nosetests) --with-coverage --exe --cover-package=ChromeController tests'
+    # - exec su testuser -c python $(which nosetests) --with-coverage --exe --cover-package=ChromeController tests
+
+
+test:python3.7:
+  extends: .test
+  image: python:3.7
+
+test:python3.8:
+  extends: .test
+  image: python:3.8
+
+test:python3.9:
+  extends: .test
+  image: python:3.9
+

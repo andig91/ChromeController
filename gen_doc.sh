@@ -24,11 +24,16 @@ set -e
 python3 gen_class.py
 
 
+python3 -m pydoc -w ChromeController.TabPooledChromium
+python3 -m pydoc -w ChromeController.ChromeExecutionManager
 python3 -m pydoc -w ChromeController.ChromeRemoteDebugInterface
-python3 -m pydoc -w ChromeController.ChromeSocketManager
 python3 -m pydoc -w ChromeController.Generator
+python3 -m pydoc -w ChromeController.Generator.Generated
 python3 -m pydoc -w ChromeController.Generator.gen
 python3 -m pydoc -w ChromeController
+python3 -m pydoc -w ChromeController.filter_funcs
+python3 -m pydoc -w ChromeController.exit_handler
+python3 -m pydoc -w ChromeController.__main__
 python3 -m pydoc -w ChromeController.manager
 python3 -m pydoc -w ChromeController.cr_exceptions
 python3 -m pydoc -w ChromeController.chrome_context
@@ -39,11 +44,17 @@ python3 -m pydoc -w ChromeController.transport
 mv ChromeController.chrome_context.html                ./docs/ChromeController.chrome_context.html
 mv ChromeController.cr_exceptions.html                 ./docs/ChromeController.cr_exceptions.html
 mv ChromeController.Generator.gen.html                 ./docs/ChromeController.Generator.gen.html
+mv ChromeController.Generator.Generated.html           ./docs/ChromeController.Generator.Generated.html
 mv ChromeController.Generator.html                     ./docs/ChromeController.Generator.html
+mv ChromeController.exit_handler.html                  ./docs/ChromeController.exit_handler.html
+mv ChromeController.filter_funcs.html                  ./docs/ChromeController.filter_funcs.html
+mv ChromeController.__main__.html                      ./docs/ChromeController.__main__.html
 mv ChromeController.html                               ./docs/ChromeController.html
 mv ChromeController.manager_base.html                  ./docs/ChromeController.manager_base.html
 mv ChromeController.tab_pool.html                      ./docs/ChromeController.tab_pool.html
 mv ChromeController.manager.html                       ./docs/ChromeController.manager.html
 mv ChromeController.transport.html                     ./docs/ChromeController.transport.html
 mv ChromeController.ChromeRemoteDebugInterface.html    ./docs/ChromeController.ChromeRemoteDebugInterface.html
+mv ChromeController.ChromeExecutionManager.html        ./docs/ChromeController.ChromeExecutionManager.html
+mv ChromeController.TabPooledChromium.html             ./docs/ChromeController.TabPooledChromium.html
 

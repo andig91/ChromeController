@@ -77,8 +77,8 @@ class ChromeRemoteDebugInterface(ChromeRemoteDebugInterface_base):
 			assert all([isinstance(val, int) for val in visible_size]), "visible_size must be a 2-tuple containing 2 integers"
 			self.log.debug("Visible size overridden to %sx%s" % visible_size)
 			self.Emulation_setVisibleSize(*visible_size)
-		else:
-			self.Emulation_setVisibleSize(1024, 1366)
+		# else:
+		# 	self.Emulation_setVisibleSize(1024, 1366)
 
 		self.__new_tab_scripts = []
 
@@ -746,18 +746,22 @@ class ChromeRemoteDebugInterface(ChromeRemoteDebugInterface_base):
 		assert 'searchId' in res['result']
 		searchid = res['result']['searchId']
 		res_cnt  = res['result']['resultCount']
-		self.log.debug("%s", res)
-		self.log.debug("%s", searchid)
+		self.log.info("res -> %s", res)
+		self.log.info("searchid -> %s", searchid)
 
 		if res_cnt == 0:
-			return None
+			return []
 
 		items = self.DOM_getSearchResults(searchId=searchid, fromIndex=0, toIndex=res_cnt)
 
-		self.log.debug("Results:")
-		self.log.debug("%s", items)
+		self.log.info("Results:")
+		self.log.info("items -> %s", items)
 
-		# DOM_getSearchResults
+		assert 'result' in items
+		assert 'nodeIds' in items['result']
+		node_ids  = items['result']['nodeIds']
+
+		return node_ids
 
 
 	def click_element(self, contains_url):
@@ -963,6 +967,7 @@ class ChromeRemoteDebugInterface(ChromeRemoteDebugInterface_base):
 			while 1:
 				if time.time() - start_time > max_wait_timeout:
 					self.log.debug("Page was not idle after waiting %s seconds. Giving up and extracting content now.", max_wait_timeout)
+					break
 				self.transport.recv_filtered(
 						filter_funcs.wait_for_methods(target_events),
 						tab_key = self.tab_id,
@@ -973,16 +978,7 @@ class ChromeRemoteDebugInterface(ChromeRemoteDebugInterface_base):
 			# We timed out, the DOM is probably idle.
 			pass
 
-
-
-		# We have to find the DOM root node ID
-		dom_attr = self.DOM_getDocument(depth=-1, pierce=False)
-		assert 'result' in dom_attr
-		assert 'root' in dom_attr['result']
-		assert 'nodeId' in dom_attr['result']['root']
-
-		# Now, we have the root node ID.
-		root_node_id = dom_attr['result']['root']['nodeId']
+		root_node_id = self.get_dom_root_id()
 
 		# Use that to get the HTML for the specified node
 		response = self.DOM_getOuterHTML(nodeId=root_node_id)
@@ -1109,4 +1105,110 @@ class ChromeRemoteDebugInterface(ChromeRemoteDebugInterface_base):
 
 
 
+
+
+
+	def scroll_page(self, scroll_y_delta, scroll_x_delta=0, mouse_pos_x=10, mouse_pos_y=10):
+		'''
+		Inject a synthezised mouse scroll event into the page.
+
+		Positive Y scroll means "down" on the page. The mouse position is where the
+		virtual mouse pointer is placed when it emits the scroll event.
+
+		Note that this returns immediately, and the browser takes a short period of time
+		to actually perform the scroll (and for any onscroll() events to be triggered.)
+
+		Additionally, scroll events are delta relatve to the current viewport. Repeated
+		calls with the same scroll delta will incrementally move the viewport in the
+		chosen direction.
+		'''
+
+		self.Input_dispatchMouseEvent(
+				type        = 'mouseWheel',
+				x           = mouse_pos_x,
+				y           = mouse_pos_y,
+				deltaX      = scroll_x_delta,
+				deltaY      = scroll_y_delta,
+				pointerType = 'mouse',
+			)
+
+
+	def get_dom_root_id(self):
+		'''
+		Get the NodeID for the DOM Root.
+
+		This assumes the page has fully loaded.
+		'''
+
+
+
+		# We have to find the DOM root node ID
+		dom_attr = self.DOM_getDocument(depth=-1, pierce=False)
+		assert 'result' in dom_attr
+		assert 'root' in dom_attr['result']
+		assert 'nodeId' in dom_attr['result']['root']
+
+		# Now, we have the root node ID.
+		root_node_id = dom_attr['result']['root']['nodeId']
+
+		return root_node_id
+
+	def get_dom_item_center_coords(self, dom_object_id):
+		'''
+		Given a DOM object ID, scroll it into view (if needed), and
+		return it's center point coordinates.
+		'''
+
+		# Scroll the dom object into view
+		self.DOM_scrollIntoViewIfNeeded(nodeId=dom_object_id)
+
+
+		res = self.DOM_getContentQuads(nodeId=dom_object_id)
+
+		assert 'result' in res
+		assert 'quads' in res['result']
+
+		quads = res['result']['quads']
+
+		if not quads:
+			return []
+
+		p1_x, p1_y, p2_x, p2_y, p3_x, p3_y, p4_x, p4_y = quads[0]
+
+
+		max_x = max([p1_x, p2_x, p3_x, p4_x])
+		max_y = max([p1_y, p2_y, p3_y, p4_y])
+
+		min_x = min([p1_x, p2_x, p3_x, p4_x])
+		min_y = min([p1_y, p2_y, p3_y, p4_y])
+
+		half_x = (max_x - min_x) / 2
+		half_y = (max_y - min_y) / 2
+
+		return min_x + half_x, min_y + half_y
+
+
+	def click_item_at_coords(self, x_pos, y_pos):
+		'''
+		Use the input api to generate a mouse click event at the specified coordinates.
+
+		Note that if this generates a navigation event, it will not wait for that navigation
+		to complete before returning.
+
+		'''
+
+		self.Input_dispatchMouseEvent(
+			type='mousePressed',
+			x = x_pos,
+			y = y_pos,
+			button = 'left',
+			clickCount=1,
+		)
+		self.Input_dispatchMouseEvent(
+			type='mouseReleased',
+			x = x_pos,
+			y = y_pos,
+			button = 'left',
+			clickCount=1,
+		)
 

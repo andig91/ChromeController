@@ -11,6 +11,7 @@ import socket
 import time
 import pprint
 import logging
+import shlex
 import os.path
 import requests
 import traceback
@@ -20,9 +21,11 @@ import subprocess
 import distutils.spawn
 from . import cr_exceptions
 
-if 'win' in sys.platform:
+if sys.platform == 'win32':
+	import pywintypes
 	import win32con
 	import win32api
+
 
 ACTIVE_PORTS = set()
 
@@ -42,6 +45,7 @@ class ChromeExecutionManager():
 			websocket_timeout  = 10,
 			enable_gpu         = False,
 			headless           = True,
+			xvfb               = False,
 			additional_options = [],
 			):
 		"""
@@ -74,6 +78,7 @@ class ChromeExecutionManager():
 		self.host               = host
 		self.port               = port
 		self.headless           = headless
+		self.xvfb               = xvfb
 		self.enable_gpu         = enable_gpu
 		self.msg_id             = 0
 		self.websocket_timeout  = websocket_timeout
@@ -100,24 +105,48 @@ class ChromeExecutionManager():
 					raise
 
 		# self.log.info("Connecting to %s:%s", self.host, self.port)
-		# self.connect(base_tab_key)
+		# self.connect_to_chromium(base_tab_key)
 
+		self._messages = {}
+		self._message_filters = {}
 
-		self.messages = {}
 
 	def _launch_process(self, binary, dbg_port, base_tab_key, additional_options):
 
 		if binary is None:
-			binary = "chromium"
+
+			# Probably not a /great/ assumption, but windows is a thing
+			if sys.platform == 'win32':
+				binary = "chrome.exe"
+			else:
+				binary = "chromium"
+
+		binary, *args = shlex.split(binary)
+
 		if not os.path.exists(binary):
-			fixed = distutils.spawn.find_executable(binary)
+
+			# Handle new and old chrome
+			searches = os.pathsep.join([os.environ['PATH'],
+				r"C:\Progra~1\Google\Chrome\Application",   # 'Program Files'
+				r"C:\Progra~2\Google\Chrome\Application"])  # 'Program Files (x86)'
+
+			fixed = distutils.spawn.find_executable(binary, path=searches)
 			if fixed:
 				binary = fixed
 		if not binary or not os.path.exists(binary):
-			raise RuntimeError("Could not find binary '%s'" % binary)
+			self.log.warning("Could not find binary '%s'" % binary)
 
-		argv = [
-				binary,
+		if self.headless and self.xvfb:
+			raise RuntimeError("Headless mode with XVFB does not make sense")
+
+		prefix = []
+		if self.xvfb:
+			prefix = ['xvfb-run',
+					 '-a',
+					 '--server-args=-screen 0 1920x1080x24 -ac -nolisten tcp -dpi 96 +extension RANDR',
+					 ]
+
+		argv = prefix + [binary] + args + [
 				'--remote-debugging-port={dbg_port}'.format(dbg_port=dbg_port),
 				'--enable-features=NetworkService',
 			]
@@ -132,7 +161,7 @@ class ChromeExecutionManager():
 		# We need a separate process group on windows,
 		# to make ctrl+c work properly.
 		creationflags = 0
-		if 'win' in sys.platform:
+		if sys.platform == 'win32':
 			creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
 
 		preexec_fn = None
@@ -150,6 +179,7 @@ class ChromeExecutionManager():
 
 		self.log.debug("Spawned process: %s, PID: %s", self.cr_proc, self.cr_proc.pid)
 		for x in range(100):
+			self._check_process_dead()
 			try:
 				self.tablist = self.fetch_tablist()
 
@@ -165,10 +195,16 @@ class ChromeExecutionManager():
 				time.sleep(2)
 
 	def __close_internal_linux(self):
+		'''
+		Shut down the chrome process. On linux, this will call terminate() on the process
+		if chrome does not shut down within the timeout (5 seconds).
+		'''
+
+
 		self.log.debug("Sending sigint to chromium")
 		self.cr_proc.send_signal(signal.SIGINT)
 		try:
-			self.check_process_ded()  # Needed to flush the communcation pipes, sometimes
+			self._check_process_dead()  # Needed to flush the communcation pipes, sometimes
 			self.log.debug("Waiting for chromium to exit")
 			try:
 				self.cr_proc.wait(timeout=5)
@@ -180,14 +216,14 @@ class ChromeExecutionManager():
 			except ProcessLookupError:
 				self.log.debug("Process exited normally, no need to terminate.")
 
-			self.check_process_ded()  # Processes may dangle until the pipes are closed.
+			self._check_process_dead()  # Processes may dangle until the pipes are closed.
 
 			try:
 				self.cr_proc.kill()
 			except ProcessLookupError:
 				self.log.debug("Process exited normally, no need to terminate.")
 
-			self.check_process_ded()  # Processes may dangle until the pipes are closed.
+			self._check_process_dead()  # Processes may dangle until the pipes are closed.
 
 		except cr_exceptions.ChromeDiedError:
 			# Considering we're /trying/ to kill chrome, it
@@ -198,15 +234,32 @@ class ChromeExecutionManager():
 		self.log.debug("Chromium closed!")
 
 	def __close_internal_windows(self):
+		'''
+		Shut down the chrome process. On linux, this will emit a CTRL+C event to the process
+		if chrome does not shut down within the timeout (5 seconds).
+		'''
+
 		self.log.debug("Sending CTRL_C_EVENT to chromium")
 
-		win32api.GenerateConsoleCtrlEvent(win32con.CTRL_C_EVENT, self.cr_proc.pid)
-		self.cr_proc.send_signal(signal.CTRL_BREAK_EVENT)
-		self.cr_proc.send_signal(signal.CTRL_C_EVENT)
-		self.cr_proc.send_signal(1)
-		self.log.debug("Sent")
 		try:
-			self.check_process_ded()  # Needed to flush the communcation pipes, sometimes
+			win32api.GenerateConsoleCtrlEvent(win32con.CTRL_C_EVENT, self.cr_proc.pid)
+			self.cr_proc.send_signal(signal.CTRL_BREAK_EVENT)
+			self.cr_proc.send_signal(signal.CTRL_C_EVENT)
+			self.cr_proc.send_signal(1)
+
+		except (OSError, SystemError, pywintypes.error) as e:
+			# Ignore "invalid handle" errors, probably caused by running without a shell
+			# (e.g. in pyinstaller frozen bundle with --noconsole).
+			if 6 == getattr(e, "winerror", getattr(e.__cause__, "winerror", -1)):
+				self.log.debug("Sending signal failed; attempting termination.")
+			else:
+				raise
+
+		else:
+			self.log.debug("Sent")
+
+		try:
+			self._check_process_dead()  # Needed to flush the communcation pipes, sometimes
 
 			# I can't get this to fucking ever work,
 			# so just skip and go straight to termination.
@@ -221,14 +274,14 @@ class ChromeExecutionManager():
 			except ProcessLookupError:
 				self.log.debug("Process exited normally, no need to terminate.")
 
-			self.check_process_ded()  # Processes may dangle until the pipes are closed.
+			self._check_process_dead()  # Processes may dangle until the pipes are closed.
 
 			try:
 				self.cr_proc.kill()
 			except ProcessLookupError:
 				self.log.debug("Process exited normally, no need to terminate.")
 
-			self.check_process_ded()  # Processes may dangle until the pipes are closed.
+			self._check_process_dead()  # Processes may dangle until the pipes are closed.
 
 		except cr_exceptions.ChromeDiedError:
 			self.log.debug("ChromeDiedError while polling. Ignoring due to shutdown.")
@@ -252,7 +305,7 @@ class ChromeExecutionManager():
 		'''
 		if self.cr_proc:
 			try:
-				if 'win' in sys.platform:
+				if sys.platform == 'win32':
 					self.__close_internal_windows()
 				else:
 					self.__close_internal_linux()
@@ -265,7 +318,13 @@ class ChromeExecutionManager():
 		ACTIVE_PORTS.discard(self.port)
 
 
-	def check_process_ded(self):
+	def _check_process_dead(self):
+		'''
+		Poll the chromium sub-process to check if it's still alive.
+
+		Will raise cr_exceptions.ChromeDiedError if chrome is not alive.
+
+		'''
 		self.cr_proc.poll()
 		if self.cr_proc.returncode != None:
 			try:
@@ -277,7 +336,11 @@ class ChromeExecutionManager():
 				# If so, ignore the resulting error.
 				raise cr_exceptions.ChromeDiedError("Chromium process died unexpectedly! Don't know how to continue!")
 
+
 	def _get_tab_idx_for_key(self, tab_key):
+		'''
+
+		'''
 
 		if tab_key not in self.tab_id_map:
 			return None
@@ -304,11 +367,16 @@ class ChromeExecutionManager():
 
 		return self.tab_id_map[tab_key]
 
-	def connect(self, tab_key):
+	def connect_to_chromium(self, tab_key):
 		"""
 		Open a websocket connection to remote browser, determined by
 		self.host and self.port.  Each tab has it's own websocket
 		endpoint.
+
+		Note that the manager maintains a connection to a blank tab to
+		prevent closing all remote tabs from causing the browser to exit.
+		This tab is not used by anything.
+
 
 		"""
 
@@ -383,6 +451,7 @@ class ChromeExecutionManager():
 
 		try:
 			self.log.info("Setting up websocket connection for key '%s'", tab_key)
+			# self.log.info("Chromium websocket URL: '%s'", wsurl)
 			self.soclist[tab_key] = websocket.create_connection(wsurl)
 			self.soclist[tab_key].settimeout(self.websocket_timeout)
 
@@ -452,12 +521,29 @@ class ChromeExecutionManager():
 	def __check_open_socket(self, tab_key):
 		# self.log.info("__check_open_socket -> %s", tab_key)
 		if not tab_key in self.soclist:
-			self.connect(tab_key=tab_key)
+			self.connect_to_chromium(tab_key=tab_key)
 		if self.soclist[tab_key].connected is not True:
-			self.connect(tab_key=tab_key)
-		if not tab_key in self.messages:
-			self.messages[tab_key] = []
+			self.connect_to_chromium(tab_key=tab_key)
+		if not tab_key in self._messages:
+			self._messages[tab_key] = []
 
+
+	def asynchronous_command(self, command, tab_key, **params):
+		"""
+		Asynchronously send command `command` with params `params` in the
+		remote chrome instance, returning the send_id for the sent command.
+		"""
+		self.log.debug("Asynchronous_command to tab %s (%s):", tab_key, self._get_cr_tab_meta_for_key(tab_key))
+		self.log.debug("	command: '%s'", command)
+		self.log.debug("	params:  '%s'", params)
+		self.log.debug("	tab_key:  '%s'", tab_key)
+
+		send_id = self.send(command=command, tab_key=tab_key, params=params)
+
+		self.log.debug("	send_id: '%s'", send_id)
+
+		# self.log.debug("	resolved tab idx %s:", self.tab_id_map[tab_key])
+		return send_id
 
 	def synchronous_command(self, command, tab_key, **params):
 		"""
@@ -505,7 +591,7 @@ class ChromeExecutionManager():
 		# self.log.debug("		Sending: '%s'", navcom)
 		try:
 			self.soclist[tab_key].send(navcom)
-		except (socket.timeout, websocket.WebSocketTimeoutException):
+		except (socket.timeout, BlockingIOError, websocket.WebSocketTimeoutException):
 			raise cr_exceptions.ChromeCommunicationsError("Failure sending command to chromium.")
 		except websocket.WebSocketConnectionClosedException:
 			raise cr_exceptions.ChromeCommunicationsError("Websocket appears to have been closed. Is the"
@@ -516,19 +602,33 @@ class ChromeExecutionManager():
 		return sent_id
 
 
-	def ___recv(self, tab_key, timeout=None):
+	def __recv(self, tab_key, timeout=None):
+		'''
+		Receive one item (or none, if no items are available and the timeout has expired).
 
+		If none is specified as the timeout, a timeout of 0 will be used (e.g. non-blocking mode.)
+		'''
 		try:
 			if timeout:
 				self.soclist[tab_key].settimeout(timeout)
+
+			else:
+				self.soclist[tab_key].settimeout(0)
 
 			tmp = self.soclist[tab_key].recv()
 			self.log.debug("		Received: '%s'", tmp)
 
 			decoded = json.loads(tmp)
+
+			# Run the new message through any message handler listeners (if present)
+			if tab_key in self._message_filters:
+				for handler in self._message_filters[tab_key]:
+					handler(decoded)
+
 			return decoded
-		except (socket.timeout, websocket.WebSocketTimeoutException):
+		except (socket.timeout, BlockingIOError, websocket.WebSocketTimeoutException):
 			return None
+
 		except websocket.WebSocketConnectionClosedException:
 			raise cr_exceptions.ChromeCommunicationsError("Websocket appears to have been closed. Is the"
 				" remote chromium instance dead?")
@@ -598,18 +698,19 @@ class ChromeExecutionManager():
 		self.__check_open_socket(tab_key)
 
 		# First, check if the message has already been received.
-		for idx in range(len(self.messages[tab_key])):
-			if keycheck(self.messages[tab_key][idx]):
-				return self.messages[tab_key].pop(idx)
+		for idx in range(len(self._messages[tab_key])):
+			if keycheck(self._messages[tab_key][idx]):
+				return self._messages[tab_key].pop(idx)
 
 		timeout_at = time.time() + timeout
 		while 1:
-			tmp = self.___recv(tab_key)
+			tmp = self.__recv(tab_key)
+
 			self.__check_console_log(tmp)
 			if keycheck(tmp):
 				return tmp
 			else:
-				self.messages[tab_key].append(tmp)
+				self._messages[tab_key].append(tmp)
 
 			if time.time() > timeout_at:
 				if message:
@@ -650,23 +751,32 @@ class ChromeExecutionManager():
 
 		self.__check_open_socket(tab_key)
 		# First, check if the message has already been received.
-		ret           = [tmp for tmp in self.messages[tab_key] if keycheck(tmp)]
-		self.messages[tab_key] = [tmp for tmp in self.messages[tab_key] if not keycheck(tmp)]
+		ret           = [tmp for tmp in self._messages[tab_key] if keycheck(tmp)]
+		self._messages[tab_key] = [tmp for tmp in self._messages[tab_key] if not keycheck(tmp)]
 
 		self.log.debug("Waiting for all messages from the socket")
 		timeout_at = time.time() + timeout
 		while 1:
-			tmp = self.___recv(tab_key, timeout=timeout)
+			tmp = self.__recv(tab_key, timeout=timeout)
 			if keycheck(tmp):
 				ret.append(tmp)
 			else:
-				self.messages[tab_key].append(tmp)
+				self._messages[tab_key].append(tmp)
 
 			if time.time() > timeout_at:
 				return ret
 			else:
 				self.log.debug("Sleeping: %s, %s" % (timeout_at, time.time()))
 				time.sleep(0.005)
+
+	def process_available(self, tab_key, timeout=0.1):
+		'''
+		Process all messages in the socket rx queue.
+
+		Will block for at least 100 milliseconds.
+
+		'''
+		self.__recv(tab_key, timeout=timeout)
 
 	def recv(self, tab_key, message_id=None, timeout=30):
 		'''
@@ -684,11 +794,11 @@ class ChromeExecutionManager():
 		self.__check_open_socket(tab_key)
 
 		# First, check if the message has already been received.
-		for idx in range(len(self.messages[tab_key])):
-			if self.messages[tab_key][idx]:
-				if "id" in self.messages[tab_key][idx] and message_id:
-					if self.messages[tab_key][idx]['id'] == message_id:
-						return self.messages[tab_key].pop(idx)
+		for idx in range(len(self._messages[tab_key])):
+			if self._messages[tab_key][idx]:
+				if "id" in self._messages[tab_key][idx] and message_id:
+					if self._messages[tab_key][idx]['id'] == message_id:
+						return self._messages[tab_key].pop(idx)
 
 		# Then spin untill we either have the message,
 		# or have timed out.
@@ -696,7 +806,7 @@ class ChromeExecutionManager():
 			if message_id is None:
 				return True
 			if not message:
-				self.log.debug("Message is not true (%s)!", message)
+				# self.log.debug("Message is not true (%s)!", message)
 				return False
 			if "id" in message:
 				return message['id'] == message_id
@@ -708,9 +818,12 @@ class ChromeExecutionManager():
 		'''
 		Flush the pending RX buffer for a specific tab key.
 		'''
-		self.messages[tab_key] = []
+		self._messages[tab_key] = []
 
-
+		# Finally, flush any pending (unprocessed) messages
+		tmp = self.__recv(tab_key)
+		while tmp is not None:
+			tmp = self.__recv(tab_key)
 
 	def drain(self, tab_key):
 		'''
@@ -718,15 +831,15 @@ class ChromeExecutionManager():
 		'''
 		self.log.debug("Draining transport")
 		ret = []
-		while len(self.messages[tab_key]):
-			ret.append(self.messages[tab_key].pop(0))
+		while len(self._messages[tab_key]):
+			ret.append(self._messages[tab_key].pop(0))
 
 		self.log.debug("Polling socket")
 
-		tmp = self.___recv(tab_key)
+		tmp = self.__recv(tab_key)
 		while tmp is not None:
 			ret.append(tmp)
-			tmp = self.___recv(tab_key)
+			tmp = self.__recv(tab_key)
 
 		self.log.debug("Drained %s messages", len(ret))
 		return ret
@@ -739,6 +852,52 @@ class ChromeExecutionManager():
 			pass
 
 		ACTIVE_PORTS.discard(self.port)
+
+	def install_message_handler_for_tab_key(self, tab_key, handler):
+		'''
+		Add handler `handler` to the list of message handlers that will be called
+		on all received messages for the tab with a key of `tab_key`.
+
+		The handler will be called with the tab context for each message the tab generates.
+
+		NOTE: Handler call order is not specified!
+
+		'''
+
+		self._message_filters.setdefault(tab_key, set())
+		self._message_filters[tab_key].add(handler)
+
+
+	def remove_handlers_for_tab_key(self, tab_key, handler):
+		'''
+		Remove handler `handler` from the list of message handlers that will be called
+		on all received messages for the tab with a key of `tab_key`.
+
+		If the tab_key is not present, or the handler is not present in the tab, a
+		KeyError will be raised.
+
+		This is potentially of little use, since the tab layer uses a dynamically
+		defined closure to capture the calling tab context, so attempting to remove
+		a defined funtion will fail since the function is no longer available.
+
+		'''
+
+		tab_set = self._message_filters[tab_key]  # Will error if tab_key is not a valid tab-key.
+		tab_set.remove(handler)  # Remove the handler
+
+
+	def remove_all_handlers_for_tab_key(self, tab_key):
+		'''
+		Add handler `handler` to the list of message handlers that will be called on all received messages.
+
+		If the tab key is not present, no error will be raised.
+
+		'''
+
+		if tab_key in self._message_filters:
+			tab_set = self._message_filters[tab_key]
+			tab_set.clear()
+
 
 if __name__ == '__main__':
 	import doctest
